@@ -5,8 +5,7 @@ import pandas as pd
 import pdfplumber
 import anthropic
 
-# 1. Environment Setup
-# Try to load environment variables from a .env file (like API keys)
+# 1. Environment Initialization: Load environment variables (e.g., API keys) if a .env file exists
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -16,7 +15,8 @@ except ImportError:
 INPUT_DIR = "input/" if os.path.exists("input/") else "../inputs/"
 OUTPUT_DIR = "output/" if os.path.exists("output/") else "../outputs/"
 
-# 2. Few-Shot Examples (Learning Materials)
+# 2. Few-Shot Data Payload
+# This contains the few-shot examples serialized dynamically from few_shot.json during the build step.
 FEW_SHOT_JSON = r"""[
   {
     "input_file": "1. IVC DOE R2 (Input).xlsx",
@@ -35,16 +35,33 @@ FEW_SHOT_JSON = r"""[
   }
 ]"""
 
-# 3. Data Extraction Functions
+# 3. Data Ingestion & Formatting Parsers
 def excel_to_text(path):
+    """Parses an Excel file via pandas and serializes it to a raw CSV format string."""
     try:
         df = pd.read_excel(path, header=None)
         return df.to_csv(index=False, header=False)
     except Exception as e:
         return str(e)
 
-# UPGRADE 4: Advanced PDF Parsing with OCR Fallback
+def docx_to_text(path):
+    """Extracts and concatenates text from all paragraphs within a Word (.docx) document."""
+    try:
+        import docx
+        doc = docx.Document(path)
+        return "\n".join([para.text for para in doc.paragraphs])
+    except ImportError:
+        print("  -> Dependency error: python-docx not installed. Operating blindly.")
+        return ""
+    except Exception as e:
+        print(f"  -> Word parsing error: {e}")
+        return str(e)
+
 def pdf_to_text(path):
+    """
+    Parses a logical text layer from a PDF document using pdfplumber.
+    Falls back to Tesseract OCR if the extracted text payload is < 50 chars (indicating scanned image).
+    """
     text = ""
     try:
         with pdfplumber.open(path) as pdf:
@@ -55,9 +72,8 @@ def pdf_to_text(path):
     except Exception as e:
         print(f"PDF error: {e}")
         
-    # If the text is suspiciously short (e.g. Scanned image), attempt OCR Fallback
     if len(text.strip()) < 50:
-        print("  -> Very little text found. Attempting OCR Fallback...")
+        print("  -> Insufficient text layer detected. Attempting OCR Fallback...")
         try:
             import pytesseract
             from pdf2image import convert_from_path
@@ -69,25 +85,30 @@ def pdf_to_text(path):
                 print("  -> OCR Success!")
                 return ocr_text
         except ImportError:
-            print("  -> OCR failed: pytesseract or pdf2image not installed. Operating blindly.")
+            print("  -> OCR dependencies (pytesseract, pdf2image) not found. Operating blindly.")
         except Exception as e:
             print(f"  -> OCR Error: {e}")
             
     return text
 
 def extract_text(path):
+    """Dispatcher for text extraction based on file extension."""
     if path.lower().endswith(".pdf"):
         return pdf_to_text(path)
     elif path.lower().endswith((".xlsx", ".xls")):
         return excel_to_text(path)
+    elif path.lower().endswith((".doc", ".docx")):
+        return docx_to_text(path)
     else:
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
             return f.read()
 
-# Helper to cleanly extract JSON even if there is conversational text
 def extract_json_from_response(text):
+    """
+    Parses the LLM's raw response string to isolate and extract the JSON array.
+    It strips out the Chain-of-Thought <thinking> blocks and any surrounding markdown code fences.
+    """
     text = text.strip()
-    # UPGRADE 2: Strip Chain of Thought thinking block if it exists
     if "<thinking>" in text and "</thinking>" in text:
         text = text.split("</thinking>")[-1].strip()
     
@@ -99,17 +120,25 @@ def extract_json_from_response(text):
         text = text[:-3]
     return text.strip()
 
-# 5. Pipeline Logic
+# 4. Core LLM Orchestration Pipeline
 def process_file(file_path, output_path):
+    """
+    Core pipeline to process a single file and extract risk data.
+    It handles:
+    - Text extraction and context window truncation.
+    - Compiling the Chain-of-Thought few-shot prompt.
+    - Sending requests to the Anthropic API with exponential backoff for rate limits.
+    - An agentic retry loop to catch and self-correct any JSON schema or formatting violations.
+    """
     print(f"Processing: {file_path}")
     raw_text = extract_text(file_path)
     
     max_chars = 200000
     if len(raw_text) > max_chars:
-        print(f"Warning: Text truncated from {len(raw_text)} to {max_chars} characters.")
+        print(f"Warning: Text payload truncated from {len(raw_text)} to {max_chars} chars to fit context window.")
         raw_text = raw_text[:max_chars]
         
-    # UPGRADE 2: Chain of Thought Strategy
+    # Few-Shot Chain-of-Thought Prompt Configuration
     prompt = (
         "You are an expert Data Engineer tasked with transforming raw, unstructured risk registers "
         "into clean, standardized machine-readable JSON formats.\n"
@@ -128,55 +157,54 @@ def process_file(file_path, output_path):
     client = anthropic.Anthropic()
     messages = [{"role": "user", "content": prompt}]
     
-    # UPGRADE 1 & 3: Agentic Self-Correction Loop & Exponential Backoff
+    # Agentic Recovery Loop (max 3 retries for schema/json formatting violations)
     max_agent_retries = 3
     for attempt in range(max_agent_retries):
-        print(f"  -> Contacting Claude API (Attempt {attempt+1}/{max_agent_retries})...")
+        print(f"  -> Sending payload to Claude API (Agentic Attempt {attempt+1}/{max_agent_retries})...")
         
-        # Exponential backoff for rate limits
+        # Exponential Backoff for resilient API interactions (Status 429)
         api_retries = 5
         response = None
         for api_attempt in range(api_retries):
             try:
                 response = client.messages.create(
-                    model="claude-3-5-sonnet-20241022",
+                    model="claude-sonnet-4-6",
                     max_tokens=8192,
                     temperature=0.0,
                     messages=messages
                 )
-                break # Success
+                break
             except anthropic.RateLimitError:
                 sleep_time = 2 ** api_attempt
-                print(f"  -> Rate limit hit. Waiting {sleep_time}s...")
+                print(f"  -> Status 429: Rate limit hit. Backoff waiting {sleep_time}s...")
                 time.sleep(sleep_time)
             except anthropic.APIError as e:
-                print(f"  -> API Error: {e}. Retrying in 5s...")
+                print(f"  -> Status 500/API Error: {e}. Retrying in 5s...")
                 time.sleep(5)
         
         if not response:
-            print(f"  -> Failed to reach API after {api_retries} attempts.")
+            print(f"  -> Fatal: Failed to reach Anthropic API after {api_retries} attempts.")
             return
 
         reply_text = response.content[0].text
         json_str = extract_json_from_response(reply_text)
         
         try:
+            # Parse and validate schema heuristic
             data = json.loads(json_str)
             if not isinstance(data, list):
-                raise ValueError("JSON is not a list of objects.")
+                raise ValueError("Payload root is not a list of objects.")
             if len(data) == 0:
-                raise ValueError("Extracted JSON array is empty.")
+                raise ValueError("JSON array successfully parsed but is completely empty.")
                 
-            # Convert to DataFrame
             df = pd.DataFrame(data)
             
-            # Simple Schema heuristic check: ensure DataFrame is valid
             if df.empty:
-                raise ValueError("Parsed DataFrame is empty.")
+                raise ValueError("DataFrame instantiation failed or frame is empty.")
                 
-            # If we succeed without errors, break the agentic loop and save
+            # Serialization
             df.to_excel(output_path, index=False)
-            print(f"  -> Saved successfully to {output_path}")
+            print(f"  -> Data serialized successfully to {output_path}")
             return
             
         except json.JSONDecodeError as e:
@@ -184,24 +212,24 @@ def process_file(file_path, output_path):
         except Exception as e:
             error_msg = f"Validation Error: {str(e)}"
             
-        # Agentic Correction: Feed the error back to Claude if it failed
-        print(f"  -> Output validation failed: {error_msg}. Asking Claude to Self-Correct...")
+        # Agentic Recovery: Push stack trace back to LLM context to prompt self-correction
+        print(f"  -> Agentic Validation trap triggered: {error_msg}. Prompting CoT correction...")
         messages.append({"role": "assistant", "content": reply_text})
         messages.append({
-            "role": "user", "content": f"Your previous output failed validation with this error: {error_msg}\nPlease try again. Output your reasoning in <thinking> tags, followed by the corrected JSON array."
+            "role": "user", "content": f"Your previous output triggered an exception: {error_msg}\nPlease self-correct. Output reasoning in <thinking>, followed strictly by the corrected JSON array."
         })
         
-    print(f"  -> Gave up processing {file_path} after max agentic retries.")
+    print(f"  -> Exhausted agentic retries. Processing failed for {file_path}.")
 
 def main():
     if not os.path.exists(INPUT_DIR):
-        print(f"Input directory {INPUT_DIR} not found.")
+        print(f"Input path {INPUT_DIR} not found.")
         return
     if not os.path.exists(OUTPUT_DIR):
         os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     for file_name in os.listdir(INPUT_DIR):
-        if not (file_name.endswith(".xlsx") or file_name.endswith(".pdf")):
+        if not (file_name.lower().endswith(".xlsx") or file_name.lower().endswith(".xls") or file_name.lower().endswith(".pdf") or file_name.lower().endswith(".docx") or file_name.lower().endswith(".doc")):
             continue
             
         input_path = os.path.join(INPUT_DIR, file_name)

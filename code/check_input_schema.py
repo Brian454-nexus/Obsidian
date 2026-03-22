@@ -1,28 +1,23 @@
 import pandas as pd
 import os
 
-# This script is a quick utility to inspect the shape and columns of our raw INPUT files.
-
+# Heuristic validation utility for unstructured input blobs.
 INPUT_DIR = "../inputs"
 
 def check_inputs():
-    # Loop over all Excel files in the inputs directory
+    """Attempts to auto-detect schema configurations using pandas binary parsing on the raw inputs."""
     for f in os.listdir(INPUT_DIR):
         if f.endswith(".xlsx"):
             path = os.path.join(INPUT_DIR, f)
-            print(f"--- File: {f} ---")
+            print(f"--- Ingress File: {f} ---")
             try:
-                # Some files might not have clear column headers on row 0, 
-                # but we'll load it to see what pandas auto-detects.
+                # Pandas schema detection (may fault on malformed binaries without explicit headers)
                 df = pd.read_excel(path)
                 
-                # Print the column headers that were detected
-                print("Columns:", list(df.columns))
-                # Print the number of rows x number of columns it thinks exist
-                print("Shape:", df.shape)
+                print("Detected Schema Fields:", list(df.columns))
+                print("Dimensionality Envelope:", df.shape)
             except Exception as e:
-                # If pandas crashes trying to read an extremely messed up Excel file, print the error
-                print("Error reading:", e)
+                print("Data Frame Initialization Trap:", e)
             print()
 
 if __name__ == "__main__":
